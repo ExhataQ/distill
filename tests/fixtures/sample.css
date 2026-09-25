@@ -1,0 +1,46 @@
+/* Player controls */
+.a {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.b {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.c {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.d {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: red;
+}
+
+/* nested-looking content in a comment: .x { color: blue; } should be preserved */
+.e::before {
+    content: "a { fake: brace; }";
+    background: url(icons/play;pause.png);
+}
+
+@media (max-width: 600px) {
+    .a {
+        display: none;
+    }
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
+.single {
+    color: blue;
+}

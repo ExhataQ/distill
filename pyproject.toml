@@ -1,0 +1,12 @@
+[project]
+name = "llm-source"
+version = "0.1.0"
+description = "Reversible, LLM-oriented source compression middleware (CSS first)"
+requires-python = ">=3.10"
+
+[project.scripts]
+llmsource = "llmsource.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
