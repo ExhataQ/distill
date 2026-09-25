@@ -20,8 +20,7 @@ def write_text_exact(path: Path, text: str) -> None:
 
 
 from .aggressive import ItemPairs, build_item_pairs, reconstruct_preserving_untouched_formatting
-from .cssparse import parse_stylesheet, reconstruct
-from .languages import css as css_lang
+from .languages.registry import adapter_for_language, adapter_for_path
 from .manifest import Manifest, SyncState, detect_sync_state, load_manifest, save_manifest, sha256_text
 from .tokenizer import DEFAULT_TOKENIZER, estimate_tokens
 
@@ -75,19 +74,20 @@ def prepare(project_root: str | Path, source_path: str | Path, aggressive: bool 
     rel = _rel(paths.project_root, src)
 
     source_text = read_text_exact(src)
+    adapter = adapter_for_path(src)
 
     prev_manifest = load_manifest(paths.manifest_path_for(rel))
     previous_macros = prev_manifest.macros if prev_manifest else None
 
     item_cache = {}
     if aggressive:
-        pairs = build_item_pairs(source_text)
+        pairs = build_item_pairs(source_text, adapter)
         compress_input = pairs.minified_source
         item_cache = {"original": pairs.original_texts, "minified": pairs.minified_texts}
     else:
         compress_input = source_text
 
-    llm_text, meta = css_lang.compress(compress_input, DEFAULT_TOKENIZER, previous_macros)
+    llm_text, meta = adapter.compress(compress_input, DEFAULT_TOKENIZER, previous_macros)
 
     llm_path = paths.llm_path_for(rel)
     llm_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,7 +101,7 @@ def prepare(project_root: str | Path, source_path: str | Path, aggressive: bool 
         source=rel,
         source_hash=sha256_text(source_text),
         llm_hash=sha256_text(llm_text),
-        language="css",
+        language=adapter.name,
         macros=meta["macros"],
         stats=meta["stats"],
         item_cache=item_cache,
@@ -125,24 +125,25 @@ def status(project_root: str | Path, source_path: str | Path) -> dict:
     return {"rel": rel, "state": state, "manifest": manifest}
 
 
-def validate_llm_text(llm_text: str) -> tuple[bool, str | None, str | None]:
-    """Expand + re-parse. Returns (ok, reconstructed_source, error_message)."""
+def validate_llm_text(llm_text: str, adapter) -> tuple[bool, str | None, str | None]:
+    """Expand + re-parse using the given LanguageAdapter. Returns
+    (ok, reconstructed_source, error_message)."""
     try:
-        reconstructed = css_lang.expand(llm_text)
-    except css_lang.ExpandError as e:
+        reconstructed = adapter.expand(llm_text)
+    except Exception as e:  # adapters raise their own ExpandError subtypes
         return False, None, f"expand failed: {e}"
 
     try:
-        items = parse_stylesheet(reconstructed)
-        if reconstruct(items) != reconstructed:
+        items = adapter.parse_to_items(reconstructed)
+        if "".join(items) != reconstructed:
             return False, None, "internal error: reconstruct(parse(x)) != x"
     except Exception as e:  # defensive: never let a parser crash corrupt the source
-        return False, None, f"reconstructed CSS failed structural validation: {e}"
+        return False, None, f"reconstructed source failed structural validation: {e}"
 
-    # balanced-brace sanity check (cheap, in addition to the parser managing
-    # to walk the whole file above)
-    if reconstructed.count("{") != reconstructed.count("}"):
-        return False, None, "unbalanced braces after macro expansion"
+    if adapter.extra_validate is not None:
+        err = adapter.extra_validate(reconstructed)
+        if err:
+            return False, None, err
 
     return True, reconstructed, None
 
@@ -160,6 +161,7 @@ def sync(project_root: str | Path, source_path: str | Path, recompress: bool = T
     if not llm_path.exists():
         raise LLMSourceError(f"{llm_path} is missing; run `prepare` first")
 
+    adapter = adapter_for_language(manifest.language)
     current_source = read_text_exact(src) if src.exists() else None
     llm_text = read_text_exact(llm_path)
 
@@ -182,7 +184,7 @@ def sync(project_root: str | Path, source_path: str | Path, recompress: bool = T
             f"one wins. Resolve manually, then run prepare."
         )
 
-    ok, reconstructed, err = validate_llm_text(llm_text)
+    ok, reconstructed, err = validate_llm_text(llm_text, adapter)
     if not ok:
         raise LLMSourceError(f"{rel}: validation failed, source NOT modified: {err}")
 
@@ -197,7 +199,7 @@ def sync(project_root: str | Path, source_path: str | Path, recompress: bool = T
             original_texts=manifest.item_cache["original"],
             minified_texts=manifest.item_cache["minified"],
         )
-        final_source = reconstruct_preserving_untouched_formatting(old_pairs, reconstructed)
+        final_source = reconstruct_preserving_untouched_formatting(old_pairs, reconstructed, adapter)
     else:
         final_source = reconstructed
 
@@ -216,7 +218,7 @@ def sync(project_root: str | Path, source_path: str | Path, recompress: bool = T
             source=rel,
             source_hash=sha256_text(final_source),
             llm_hash=sha256_text(llm_text),
-            language="css",
+            language=adapter.name,
             macros=manifest.macros,
             stats=manifest.stats,
             item_cache=manifest.item_cache,

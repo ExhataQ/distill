@@ -1,181 +1,195 @@
-# llm-source
+# distill
 
-A reversible, LLM-oriented source-compression middleware. This is **Milestone 1**
-from the spec: CSS only, proving the core loop works safely.
+**A reversible, LLM-oriented source-compression layer for AI coding agents.**
 
-```
-llmsource prepare src/styles.css   # generates .llm/compressed/... + .llm/manifests/...
-# an AI agent edits .llm/compressed/src/styles.css.llm directly
-llmsource sync src/styles.css      # validates, then reconstructs src/styles.css
-llmsource status src/styles.css    # token savings + sync state
-llmsource validate src/styles.css  # check the .llm file without touching source
-llmsource restore src/styles.css   # discard .llm edits, regenerate from source
-```
-
-## What's implemented (Milestone 1 + most of Milestone 2)
-
-- **Lossless CSS scanner/parser** (`scanner.py`, `cssparse.py`): string/comment/
-  paren-aware, hand-rolled (no CSS parsing library was available in this
-  offline environment — `tinycss2`/`cssutils` could not be installed; see
-  "Known limitations" below). Byte-for-byte round trip is a hard test
-  invariant (`test_parser_reconstructs_exactly`).
-- **Only fully-understood regions are touched.** A rule only becomes eligible
-  for compression if its block is an unambiguous flat list of
-  `prop: value;` declarations. `@media`, `@keyframes`, `@font-face`, CSS
-  nesting, and anything else ambiguous is preserved as opaque, untouched raw
-  text — never corrupted, never compressed.
-- **Economic macro selection** (`languages/css.py`): candidate declaration
-  spans (1..8 declarations, contiguous, exact-text match) are only turned
-  into a macro if the measured token savings clear a minimum bar, using a
-  pluggable `TokenCounter` (`tokenizer.py`). Selection is greedy
-  (longest/most-reused spans claimed first, no overlap), not globally
-  optimal — see spec section 28.
-- **`.llm` representation** is literally the original source text with
-  matched declaration spans replaced in place by `@X001;` references, plus a
-  macro-definitions header. Because nothing outside a replaced span is ever
-  touched, decompression is a pure, stateless substring substitution — no
-  external state is required to expand a `.llm` file back to source.
-- **Local macro override is free.** An AI can delete a `@X001;` reference
-  inside one rule and type a literal declaration instead; only that rule
-  changes on expand. See `test_local_macro_override_does_not_affect_other_occurrences`.
-- **Stable macro IDs** across recompression: `prepare` reuses IDs for macro
-  values that already existed in the previous manifest.
-- **Safety**: `sync` always expands into a temp file, re-parses and
-  structurally validates the result, and only then atomically replaces the
-  real source. A dangling macro reference, or any expand/parse failure,
-  aborts with an error and the source file is never touched
-  (`test_invalid_representation_never_overwrites_source`).
-- **Hashing & conflict detection**: manifest tracks the source hash and
-  `.llm` hash from the last `prepare`. `sync` refuses to guess when the
-  source changed externally, or when both source and `.llm` changed
-  independently (`SOURCE_CHANGED` / `CONFLICT` states) — see
-  `manifest.detect_sync_state`.
-- **Token reporting**: `status`/`prepare` output original/compressed/saved
-  tokens and reduction %, clearly labeled as estimates from the
-  `approx-v1` tokenizer (see Known limitations).
-
-## Compaction modes
+`distill` lets an AI agent read and edit a much smaller, denser view of your
+source files — while your real files stay exactly as they are until you
+explicitly sync the edits back. Not minification. Not a build step. A
+working cache between your repo and whatever's editing it.
 
 ```
-llmsource prepare src/styles.css               # safe mode (default)
-llmsource prepare src/styles.css --aggressive   # aggressive mode
+src/styles.css  →  distill prepare  →  .llm/compressed/styles.css.llm
+                                              ↑
+                                        AI reads/edits this
+                                              ↓
+src/styles.css  ←  distill sync     ←  (validated, reconstructed)
 ```
 
-- **safe (default)**: byte-for-byte reversible. Your real source file's
-  formatting (indentation, blank lines, comments) is never touched — only
-  the `.llm` working copy gets macro-compressed.
-- **aggressive**: the AI-facing `.llm` view is also minified (comments
-  stripped, whitespace collapsed) — but **the real source file is never
-  touched by `prepare`, in either mode.** `.llm/` is purely a cache; your
-  actual CSS file stays exactly as it was until you `sync`. On `sync`,
-  minification only ever lands on whatever the AI actually edited —
-  everything else is written back in your **original formatting**, comments
-  and all (see `aggressive.py`: an item-level diff aligns the AI's edited
-  output against what was there before, using original text for anything
-  unchanged).
+## Why
 
-  Concretely: change one declaration in a 1000-line file and `sync`
-  produces a one-hunk diff against your original — not a full-file rewrite.
-  This was iterated on live against a real ~1090-line file with CRLF line
-  endings, which caught two real bugs now covered by regression tests:
-  `Path.read_text()`'s silent CRLF→LF conversion (`test_crlf_line_endings
-  _survive_byte_exact`), and a trailing end-of-file newline that
-  disappeared on any edit elsewhere (`test_trailing_newline_survives_an
-  _unrelated_edit`).
+Handing an AI agent a large source file costs tokens on every read, and
+most of those tokens are structural repetition — the same declaration
+blocks, the same boilerplate, over and over. `distill` compresses that
+repetition into short macro references before the AI ever sees the file,
+and safely expands them back on the way out. The agent reads and edits
+less; your repo ends up exactly as intended.
 
-On the sample real-world file in this repo (~1090 lines):
+Two hard guarantees make this safe to actually use:
+
+1. **Your real files are never silently rewritten.** `distill prepare`
+   only ever writes to `.llm/` — a gitignored cache. Nothing touches your
+   source until you run `sync`, and `sync` validates before it writes
+   anything.
+2. **Editing one thing never silently changes another.** If ten rules (or
+   array elements, or object members) share a compressed macro and the AI
+   edits one of them, only that one changes — the shared macro is locally
+   overridden, not mutated.
+
+## Quickstart
+
+```bash
+pip install -e .          # no external dependencies
+
+distill prepare src/styles.css      # writes .llm/compressed/src/styles.css.llm
+# → hand that .llm file to your AI agent; it edits it directly
+
+distill sync src/styles.css         # validates, then reconstructs src/styles.css
+distill status src/styles.css       # token savings + sync state
+distill validate src/styles.css     # check the .llm file without touching source
+distill restore src/styles.css      # discard .llm edits, regenerate from source
+```
+
+`.json` files work exactly the same way — the language is picked
+automatically from the file extension.
+
+## Example
+
+```css
+.a { display: flex; align-items: center; gap: 10px; }
+.b { display: flex; align-items: center; gap: 10px; }
+.c { display: flex; align-items: center; gap: 8px;  }
+```
+
+becomes:
 
 ```
-                         safe mode   aggressive mode
-reduction vs. original:    7.0%         33.4%
+@X001 {
+display: flex;
+align-items: center;
+gap: 10px;
+}
+
+.a{@X001;}
+.b{@X001;}
+.c{display: flex;align-items: center;gap: 8px;}
 ```
 
-Most of that extra ~26 points is indentation/comments that the AI's
-compressed view no longer has to carry — none of it comes at the cost of
-your real file's formatting. Note: earlier versions of this tool's
-`ApproxTokenCounter` counted whitespace as free (0 tokens), which hid this
-entirely — see `tokenizer.py`'s `approx-v2` for the fix (a whitespace run
-now costs ~1 token, closer to real BPE behavior).
+If the AI wants `.a`'s gap to be `8px` instead, it just replaces `@X001;`
+inside `.a`'s block with the literal declarations and changes the one
+value — `.b` is untouched, because it still points at `@X001`.
 
-## Benchmark
+The same mechanism works for a JSON array of repeated records:
 
-`tests/fixtures/design_system.css` (755 lines, 80 rules, realistic
-utility/button/card/text classes with real repetition):
+```json
+[
+  {"status": "active", "role": "admin", "verified": true},
+  {"status": "active", "role": "admin", "verified": true},
+  {"status": "pending", "role": "guest", "verified": false}
+]
+```
+compresses to a shared `@X001;` for the two identical records, and expands
+back with the same local-override guarantee if the AI edits just one.
+
+## Two compaction modes
 
 ```
-original:   3430 tokens
-compressed: 1488 tokens
-saved:      1942 tokens (56.6%)
-macros:     21 (88 references)
+distill prepare src/styles.css               # safe (default)
+distill prepare src/styles.css --aggressive   # aggressive
 ```
-Round-trip verified byte-for-byte on this file too.
 
-The small `tests/fixtures/sample.css` fixture (3 tiny repeated rules)
-deliberately shows the opposite, equally important case: with only a
-little repetition, the fixed representation overhead (markers + macro
-definition wrapper) can outweigh the savings, and the tool reports that
-honestly instead of pretending compression always helps
-(`test_tiny_file_with_low_repetition_may_not_save_tokens`).
+| | safe | aggressive |
+|---|---|---|
+| Real source file | untouched, byte-for-byte reversible | **also untouched** — `.llm/` is still just a cache |
+| `.llm` view | macro-compressed, your original formatting kept | macro-compressed **and** minified (comments stripped, whitespace collapsed) |
+| On `sync` | writes back exactly what was there | writes back your **original formatting** for anything unedited; only the AI's actual edits come out minified |
+| Typical savings (real ~1090-line CSS file) | ~7% | ~33% |
 
-## Known limitations / deliberately out of scope for Milestone 1
+Change one declaration in a 1000-line file under aggressive mode and
+`sync` produces a one-hunk diff against your original — not a full-file
+rewrite. Comments and formatting survive everywhere the AI didn't touch.
 
-- **No real tokenizer.** This environment has no network access, so
-  `tiktoken` (or any BPE tokenizer) could not be installed. `tokenizer.py`
-  defines the `TokenCounter` abstraction the spec asks for, with one
-  concrete regex-based `ApproxTokenCounter` implementation. Plug in a real
-  tokenizer by implementing `TokenCounter.count()` and passing it through
-  `compress()`/`prepare()` — the rest of the pipeline doesn't care.
-- **No CSS parsing library.** Same reason (no network). `scanner.py`/
-  `cssparse.py` are a hand-rolled, deliberately conservative
-  string/comment/paren-aware scanner — not a full CSS grammar. It correctly
-  handles comments, strings (with escapes), `url()`/function parens, and
-  bails out to "preserve raw" for anything it isn't sure about, per the
-  spec's "never corrupt, never guess" rule.
-- **`@media`/`@keyframes`/nested rules are never compressed**, only
-  preserved verbatim. Extending macro compression into at-rule blocks is
-  Milestone 3 territory (spec section 20/31, language adapter interface).
-- **Matching is exact-text, not whitespace-normalized** in safe mode. Two
-  declarations that differ only in incidental spacing won't be recognized
-  as the same macro candidate. Aggressive mode's whitespace normalization
-  incidentally helps here too (formatting differences that used to block a
-  macro match are gone), which is part of why its macro count is usually
-  higher, not just its baseline token count lower.
-- **No `llmsource.reconcile` three-way merge** (spec section 19 says not to
-  build this yet). `sync --force` exists as an escape hatch when a human
-  has confirmed which side should win.
-- **No project-wide config / glob discovery** (spec section 31) — the CLI
-  takes explicit file paths for now.
-- **Only CSS.** `LanguageAdapter` isn't factored out as a formal interface
-  yet; `languages/css.py` exposes `compress`/`expand` functions that
-  `core.py` calls directly. Extracting the adapter interface (spec section
-  20) is the natural next step before adding JSON/HTML.
+## Safety details
+
+- **Byte-exact round trip.** `expand(compress(x)) == x` for any unedited
+  file — a hard test invariant, not a goal. CRLF line endings, trailing
+  newlines, comments, strings, `url()` contents/JSON escapes, and CSS you
+  don't recognize (`@media`, `@keyframes`, nested rules) are all preserved
+  exactly, never corrupted or guessed at. Malformed JSON is rejected
+  outright rather than repaired — JSON's grammar is small and fully
+  specified, so there's no safe "preserve as opaque" fallback the way
+  there is for CSS.
+- **Validate before write.** `sync` always expands into memory, re-parses,
+  and structurally validates the result before ever touching your real
+  file. A dangling macro reference or any parse failure aborts with an
+  error — your source is never overwritten with something broken.
+- **Conflict detection.** If your source file changed outside `distill`
+  since the last `prepare`, or both the source and the `.llm` file changed
+  independently, `sync` refuses to guess and tells you exactly what
+  happened.
+- **String/comment-aware expansion.** A `@X001;`-shaped substring sitting
+  inside real string content (`"note": "see @X001;"`, or a CSS
+  `content: "@X001;"`) is never mistaken for an actual macro reference —
+  expansion walks the text the same string-aware way parsing does, not a
+  blind regex substitution over the whole file.
+- **Honest token reporting.** `status` reports real, measured savings
+  (with a documented, pluggable `TokenCounter`), not assumed ones — and
+  says so plainly when a small file's fixed overhead outweighs its
+  savings, rather than pretending compression always helps.
+
+## Language support
+
+CSS and JSON today, built on a shared `LanguageAdapter` interface
+(`llmsource/languages/base.py`) so `core.py`/`aggressive.py` never import
+a specific language's parser directly — adding a language means writing
+an adapter and registering it, not touching the orchestration layer.
+
+**A real limitation worth knowing about JSON specifically:** macro
+candidates are currently only found among a document's **top-level**
+members — the direct children of the root object/array. If your root is
+itself an array of repeated records (`[{...}, {...}, {...}]`), that
+compresses well. If your root is an object wrapping the interesting array
+(`{"users": [{...}, {...}, {...}], "version": 3}` — the far more common
+real-world shape for API responses and config files), the repetition
+lives one level below the root and currently isn't seen at all. Verified
+directly: the first shape gets a macro and ~20% reduction, the second
+gets zero macros and *negative* reduction (pure representation overhead)
+on otherwise-identical repeated content. Extending itemization to
+recurse into nested containers is the natural next step, not yet done.
 
 ## Project layout
 
 ```
 llmsource/
-├── scanner.py       # string/comment/paren-aware low-level text scanning
-├── cssparse.py       # stylesheet -> ordered items (rules / opaque blocks / raw)
-├── tokenizer.py       # TokenCounter abstraction + approx implementation
-├── manifest.py       # manifest schema, hashing, sync-state detection
-├── core.py       # prepare / sync / restore / status / validate orchestration
-├── cli.py       # argparse CLI
+├── scanner.py          # CSS: string/comment/paren-aware low-level scanning
+├── cssparse.py          # CSS: stylesheet -> ordered items
+├── jsonparse.py          # JSON: strict RFC 8259 parser, same round-trip invariant
+├── minify.py          # CSS: safe, conservative whitespace/comment stripping
+├── aggressive.py          # item-level diff so minification never leaks onto untouched code
+├── tokenizer.py          # pluggable TokenCounter abstraction
+├── manifest.py          # manifest schema, hashing, sync-state detection
+├── core.py          # prepare / sync / restore / status / validate orchestration
+├── cli.py          # command-line entry point
 └── languages/
-    └── css.py       # macro selection (compress) + stateless expand
+    ├── base.py          # LanguageAdapter interface
+    ├── registry.py          # extension -> adapter lookup
+    ├── css.py          # CSS macro selection + expand
+    └── json.py          # JSON macro selection + expand
 tests/
-├── test_roundtrip.py       # the core safety invariant
-├── test_macros.py       # macro selection, local override, token accounting
-├── test_core_workflow.py       # prepare/sync/status/restore, conflict detection
-└── fixtures/
 ```
 
 ## Running tests
 
-No pytest available offline either — each test file is self-contained and
-runnable directly:
-
-```
+```bash
 python3 tests/test_roundtrip.py
 python3 tests/test_macros.py
 python3 tests/test_core_workflow.py
+python3 tests/test_minify.py
+python3 tests/test_aggressive_nondestructive.py
+python3 tests/test_json.py
 ```
+
+44 tests, no external dependencies, no network access required.
+
+## License
+
+MIT (or your preference — add a LICENSE file before publishing).

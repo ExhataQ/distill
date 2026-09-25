@@ -64,7 +64,8 @@ def _cmd_validate(args):
             print(f"{rel}: no .llm file, nothing to validate", file=sys.stderr)
             exit_code = 1
             continue
-        ok, _, err = core.validate_llm_text(core.read_text_exact(llm_path))
+        adapter = core.adapter_for_path(f)
+        ok, _, err = core.validate_llm_text(core.read_text_exact(llm_path), adapter)
         if ok:
             print(f"{rel}: valid")
         else:

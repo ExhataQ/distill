@@ -22,8 +22,7 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass
 
-from .cssparse import item_raw, parse_stylesheet
-from .minify import minify_css
+from .languages.base import LanguageAdapter
 
 
 @dataclass
@@ -36,28 +35,28 @@ class ItemPairs:
         return "".join(self.minified_texts)
 
 
-def build_item_pairs(source_text: str) -> ItemPairs:
-    """Parse the source into its natural top-level items and minify each
-    independently.
+def build_item_pairs(source_text: str, adapter: LanguageAdapter) -> ItemPairs:
+    """Parse the source into its natural top-level items (via the language
+    adapter) and minify each independently.
 
-    Important subtlety: parse_stylesheet never emits a standalone "gap"
-    item between two rules -- any whitespace/comments between one rule's
-    '}' and the next rule's selector get folded into the *next* rule's own
-    prelude (only a single trailing chunk after the very last rule can be
-    its own RawItem). So the readability newline we want between rules in
-    the AI-facing view has to be modeled the same way: prepended directly
-    onto the start of each (non-first) item's own minified text, not
-    inserted as a separate pseudo-item. That's what keeps this list
-    aligned with a fresh re-parse of the edited, concatenated result later
-    -- a fresh parse will also see that leading "\\n" as part of the
-    following item, not as something standalone.
+    Important subtlety: a language's `parse_to_items` is not guaranteed to
+    emit a standalone "gap" item between two rules/statements -- for CSS,
+    whitespace/comments between one rule's '}' and the next rule's selector
+    get folded into the *next* rule's own prelude (only a single trailing
+    chunk after the very last rule can be its own item). So the readability
+    newline we want between items in the AI-facing view has to be modeled
+    the same way: prepended directly onto the start of each (non-first)
+    item's own minified text, not inserted as a separate pseudo-item.
+    That's what keeps this list aligned with a fresh re-parse of the
+    edited, concatenated result later -- a fresh parse will also see that
+    leading "\\n" as part of the following item, not as something
+    standalone.
     """
-    items = parse_stylesheet(source_text)
+    items = adapter.parse_to_items(source_text)
     original_texts: list[str] = []
     minified_texts: list[str] = []
-    for idx, it in enumerate(items):
-        orig = item_raw(it)
-        mini = minify_css(orig)
+    for idx, orig in enumerate(items):
+        mini = adapter.minify_item(orig)
         if idx > 0 and mini:
             mini = "\n" + mini
         original_texts.append(orig)
@@ -76,15 +75,14 @@ def build_item_pairs(source_text: str) -> ItemPairs:
 
 
 def reconstruct_preserving_untouched_formatting(
-    old_pairs: ItemPairs, new_minified_source: str
+    old_pairs: ItemPairs, new_minified_source: str, adapter: LanguageAdapter
 ) -> str:
     """Given the item pairs from the last prepare() and the AI's edited
     (still-minified) full text after expand(), produce the final source:
     original formatting wherever nothing changed, the AI's new/edited text
     wherever it did.
     """
-    new_items = parse_stylesheet(new_minified_source)
-    new_texts = [item_raw(it) for it in new_items]
+    new_texts = adapter.parse_to_items(new_minified_source)
 
     sm = difflib.SequenceMatcher(a=old_pairs.minified_texts, b=new_texts, autojunk=False)
     out: list[str] = []

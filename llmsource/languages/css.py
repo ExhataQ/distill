@@ -32,8 +32,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from ..cssparse import Item, SimpleRule, parse_stylesheet, reconstruct
+from ..cssparse import Item, SimpleRule, item_raw, parse_stylesheet, reconstruct
+from ..minify import minify_css
 from ..tokenizer import TokenCounter, DEFAULT_TOKENIZER, estimate_tokens
+from .base import LanguageAdapter
 
 MACROS_MARKER = "/*LLM:MACROS*/"
 SOURCE_MARKER = "/*LLM:SOURCE*/"
@@ -121,7 +123,21 @@ def _select_macros(simple_rules: list[SimpleRule], tokenizer: TokenCounter,
             prev_by_value[info.get("value")] = mid
 
     for span_len_decls, text, occ in candidates:
-        free_occ = [(ri, s, e) for (ri, s, e) in occ if not overlaps(ri, s, e)]
+        # Filter out occurrences that overlap anything already claimed by a
+        # PREVIOUS candidate, AND occurrences that overlap an earlier
+        # occurrence of THIS SAME candidate (e.g. 3+ identical consecutive
+        # declarations produce self-overlapping span_len=2 candidates like
+        # (0,2) and (1,3) -- accepting both would double-claim declaration
+        # index 1). Greedily keep the earliest non-overlapping ones.
+        free_occ: list[tuple[int, int, int]] = []
+        locally_claimed: list[tuple[int, int]] = []
+        for (ri, s, e) in occ:
+            if overlaps(ri, s, e):
+                continue
+            if any(ri2 == ri and s < le and ls < e for (ri2, ls, le) in locally_claimed):
+                continue
+            free_occ.append((ri, s, e))
+            locally_claimed.append((ri, s, e))
         if len(free_occ) < MIN_FREQUENCY:
             continue
 
@@ -244,24 +260,113 @@ class ExpandError(Exception):
     pass
 
 
+def _expand_body(body: str, macro_map: dict[str, str]) -> str:
+    """Substitute `@Xnnn;` macro references with their definitions, but only
+    at positions that are NOT inside a CSS string or comment (same
+    string/comment-aware walk as scanner.py/minify.py). This matters because
+    naive regex substitution over the whole flattened body text would
+    misfire on a literal `@X001;`-shaped substring that happens to occur
+    inside real source content -- e.g. `content: "@X001;";` or a comment --
+    silently corrupting the reconstructed source instead of leaving it
+    alone. Unterminated strings/comments are left as-is rather than guessed
+    at; downstream structural re-validation (core.validate_llm_text) is the
+    final safety net for anything genuinely malformed.
+    """
+    n = len(body)
+    i = 0
+    out: list[str] = []
+    while i < n:
+        ch = body[i]
+
+        if ch == "/" and i + 1 < n and body[i + 1] == "*":
+            end = body.find("*/", i + 2)
+            if end == -1:
+                out.append(body[i:])
+                break
+            out.append(body[i:end + 2])
+            i = end + 2
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if body[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if body[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            else:
+                out.append(body[i:])
+                break
+            out.append(body[i:j])
+            i = j
+            continue
+
+        if ch == "@":
+            m = _MACRO_REF_RE.match(body, i)
+            if m:
+                mid = m.group(1)
+                if mid not in macro_map:
+                    raise ExpandError(f"dangling macro reference @{mid}; with no matching definition")
+                out.append(macro_map[mid])
+                i = m.end()
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def expand(llm_text: str) -> str:
-    if MACROS_MARKER not in llm_text or SOURCE_MARKER not in llm_text:
+    if not llm_text.startswith(MACROS_MARKER + "\n"):
         raise ExpandError("missing required LLMSOURCE markers; representation looks corrupted")
 
-    _, rest = llm_text.split(MACROS_MARKER, 1)
-    defs_section, body = rest.split(SOURCE_MARKER, 1)
-    if body.startswith("\n"):
-        body = body[1:]
-
+    # Parse the macro-definitions section as a contiguous sequence of
+    # well-formed `@Xnnn {\n...\n}\n` blocks anchored at each cursor
+    # position (re.match(..., pos) matches only starting exactly there,
+    # never searching ahead) rather than locating SOURCE_MARKER by scanning
+    # for its text anywhere in the file. This is what makes marker
+    # detection immune to the marker text (or a `@Xnnn;`-shaped substring)
+    # coincidentally appearing inside a macro's own definition value.
+    cursor = len(MACROS_MARKER) + 1
     macro_map: dict[str, str] = {}
-    for m in _MACRO_BLOCK_RE.finditer(defs_section):
+    while not llm_text.startswith(SOURCE_MARKER, cursor):
+        m = _MACRO_BLOCK_RE.match(llm_text, cursor)
+        if not m:
+            raise ExpandError("missing required LLMSOURCE markers; representation looks corrupted")
         macro_map[m.group("id")] = m.group("val")
+        cursor = m.end()
 
-    def _replace(m: re.Match) -> str:
-        mid = m.group(1)
-        if mid not in macro_map:
-            raise ExpandError(f"dangling macro reference @{mid}; with no matching definition")
-        return macro_map[mid]
+    cursor += len(SOURCE_MARKER)
+    if llm_text.startswith("\n", cursor):
+        cursor += 1
+    body = llm_text[cursor:]
 
-    expanded = _MACRO_REF_RE.sub(_replace, body)
-    return expanded
+    return _expand_body(body, macro_map)
+
+
+def _parse_to_items(source: str) -> list[str]:
+    return [item_raw(it) for it in parse_stylesheet(source)]
+
+
+def _extra_validate(reconstructed: str) -> str | None:
+    if reconstructed.count("{") != reconstructed.count("}"):
+        return "unbalanced braces after macro expansion"
+    return None
+
+
+# The seam core.py/aggressive.py depend on. compress()/expand() above are
+# also still importable directly by name (existing tests do this) -- this
+# object just wraps them for the language-agnostic orchestration layer.
+ADAPTER = LanguageAdapter(
+    name="css",
+    compress=compress,
+    expand=expand,
+    parse_to_items=_parse_to_items,
+    minify_item=minify_css,
+    extra_validate=_extra_validate,
+)
